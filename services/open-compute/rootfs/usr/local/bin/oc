@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# `ocd --system ...` as the open-compute user, for `railway ssh` sessions.
+# Examples:
+#   oc instances
+#   oc --instance default doctor --json
+#   oc instance stop default && oc --instance default backup create --name manual && oc instance start default
+# Written for this template.
+set -Eeuo pipefail
+# shellcheck source=../lib/oc-railway/common.sh
+. /usr/local/lib/oc-railway/common.sh
+
+cd "$OC_ROOT"
+scrub=(-u OPEN_COMPUTE_ADMIN_TOKEN -u OPEN_COMPUTE_DEPLOYER_TOKEN -u OPEN_COMPUTE_READ_ONLY_TOKEN)
+case "$(id -u)" in
+  0)
+    exec setpriv --reuid="$OC_UID" --regid="$OC_GID" --clear-groups --no-new-privs -- \
+      env "${scrub[@]}" HOME=/tmp "$OC_BIN" --no-update-check --system "$@" ;;
+  "$OC_UID")
+    exec env "${scrub[@]}" HOME=/tmp "$OC_BIN" --no-update-check --system "$@" ;;
+  *)
+    die "run oc as root or as uid $OC_UID" 1 ;;
+esac

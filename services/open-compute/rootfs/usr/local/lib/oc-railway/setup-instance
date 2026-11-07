@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# First-boot setup of the system OCD scope and its "default" instance.
+#
+# Adapted from examples/container/init-volume.sh in elliothux/open-compute
+# v0.4.0 (Copyright the open-compute authors, Apache-2.0; see NOTICE.md).
+# Changes for Railway: runs inside the long-running service instead of a
+# separate init container; ocd listens on 127.0.0.1:8787 behind Caddy; the
+# instance configuration (tokens, storage, public origin) is rendered by
+# render-config at every start, so this script only creates the scope, the
+# database, the master key and the registry entry. The caller (the entrypoint)
+# owns the markers and the retry policy.
+#
+# Runs as the open-compute user (uid 65532). Needs OPEN_COMPUTE_ADMIN_TOKEN.
+set -Eeuo pipefail
+# shellcheck source=common.sh
+. /usr/local/lib/oc-railway/common.sh
+
+umask 077
+timeout_s=${OC_SETUP_TIMEOUT_SECONDS:-300}
+init_log="$OC_ROOT/init-daemon.log"
+
+[ "$(id -u)" = "$OC_UID" ] || die "setup-instance must run as uid $OC_UID"
+: "${OPEN_COMPUTE_ADMIN_TOKEN:?OPEN_COMPUTE_ADMIN_TOKEN is required}"
+
+mkdir -p "$OC_ROOT/keys"
+chmod 0700 "$OC_ROOT" "$OC_ROOT/keys"
+write_secret_file "$OC_ROOT/keys/admin.token" "$OPEN_COMPUTE_ADMIN_TOKEN"
+{
+  printf '[server]\npublic_bind = '
+  toml_string "$OC_LISTEN"
+  printf '\nadmin_auth = { file = '
+  toml_string "$OC_ROOT/keys/admin.token"
+  printf ' }\n'
+} > "$OC_ROOT/ocd.toml"
+
+daemon=""
+stop_daemon() {
+  if [ -n "$daemon" ] && kill -0 "$daemon" 2>/dev/null; then
+    kill -TERM "$daemon" 2>/dev/null || true
+    wait "$daemon" 2>/dev/null || true
+  fi
+  daemon=""
+}
+trap stop_daemon EXIT
+trap 'exit 1' INT TERM
+
+log "setup: starting a bootstrap daemon (log: $init_log)"
+env -u OPEN_COMPUTE_ADMIN_TOKEN -u OPEN_COMPUTE_DEPLOYER_TOKEN -u OPEN_COMPUTE_READ_ONLY_TOKEN \
+  -u OC_S3_ACCESS_KEY_ID -u OC_S3_SECRET_ACCESS_KEY \
+  HOME=/tmp "$OC_BIN" --no-update-check --system run > "$init_log" 2>&1 &
+daemon=$!
+
+count=0
+until "$OC_BIN" --no-update-check --system status --json 2>/dev/null | grep -F '"state":"running"' > /dev/null; do
+  if ! kill -0 "$daemon" 2>/dev/null || [ "$count" -ge "$timeout_s" ]; then
+    tail -n 40 "$init_log" >&2 || true
+    die "setup: the bootstrap daemon did not become ready" 1
+  fi
+  count=$((count + 1))
+  sleep 1
+done
+
+log "setup: creating instance 'default' (database, master key, registry entry)"
+"$OC_BIN" --no-update-check --system instance setup --name default \
+  --config "$OC_CONFIG" --data-dir "$OC_DATA" --yes --autostart=true --start=false
+
+stop_daemon
+trap - EXIT INT TERM
+
+[ -f "$OC_DATA/keys/master.key" ] || die "setup: instance setup did not create $OC_DATA/keys/master.key" 1
+log "setup: done"

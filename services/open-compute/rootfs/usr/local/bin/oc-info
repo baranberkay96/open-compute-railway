@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Print the values a laptop or CI needs to deploy Workers here (never tokens).
+# Run inside the service with `railway ssh`, then: oc-info
+# Written for this template.
+set -Eeuo pipefail
+# shellcheck source=../lib/oc-railway/common.sh
+. /usr/local/lib/oc-railway/common.sh
+
+id=$(cat "$OC_RUN/instance-id" 2>/dev/null || true)
+base=$(lower "${OC_PUBLIC_URL:-}")
+base=${base%/}
+case "$base" in ''|https:|http:|https:/|http:/|https://|http://) base="(no public domain)" ;; esac
+
+cat <<EOF
+open-compute: $("$OC_BIN" --version 2>/dev/null | head -n 1)
+Account ID (CLOUDFLARE_ACCOUNT_ID):       ${id:-unknown - the instance has not started yet}
+API base   (CLOUDFLARE_API_BASE_URL):     $base/client/v4
+Deploy token (CLOUDFLARE_API_TOKEN):      the OPEN_COMPUTE_DEPLOYER_TOKEN variable
+Dashboard:                                $base/operator/  (admin token)
+Workers by path:                          $base/w/{worker-name}/
+Private URL for services in this project: http://${RAILWAY_PRIVATE_DOMAIN:-open-compute.railway.internal}:${PORT:-8080}
+EOF
+if [ -n "${OC_WORKERS_DOMAIN:-}" ]; then
+  printf 'Workers by host:                          https://{worker-name}.%s/\n' "$(lower "$OC_WORKERS_DOMAIN")"
+fi

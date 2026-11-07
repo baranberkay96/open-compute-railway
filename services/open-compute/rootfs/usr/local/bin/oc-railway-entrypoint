@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+# open-compute on Railway: one service, one volume at /var/lib/open-compute.
+#
+#   root:  validate variables, prepare the volume, run first-boot setup once
+#   65532: render tokens + compute.toml, `ocd --system run` on 127.0.0.1:8787
+#   65532: Caddy on $PORT in front of ocd (Worker routing, see render-caddyfile)
+#
+# Railway's init is PID 1; this script stays as the parent of ocd and Caddy,
+# forwards SIGTERM to both and exits when either of them exits, so Railway's
+# restart policy restarts the whole pair. Written for this template.
+set -Eeuo pipefail
+set -f  # no pathname expansion: route lists are split on whitespace below
+# shellcheck source=../lib/oc-railway/common.sh
+. /usr/local/lib/oc-railway/common.sh
+
+LIB=/usr/local/lib/oc-railway
+OCD_PID=""
+CADDY_PID=""
+SETUP_PID=""
+STOPPING=0
+STORAGE_DESC=""
+CONTROL_HOST=""
+
+# ---------------------------------------------------------------- signals
+stop_children() {
+  local pid
+  for pid in "$CADDY_PID" "$OCD_PID" "$SETUP_PID"; do
+    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+
+wait_children() {
+  local pid
+  for pid in "$CADDY_PID" "$OCD_PID" "$SETUP_PID"; do
+    [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+  done
+}
+
+on_signal() {
+  STOPPING=1
+  log "stop requested; stopping Caddy and ocd"
+  stop_children
+  wait_children
+  exit 0
+}
+
+on_exit() {
+  # Error paths (die) must not leave ocd or Caddy running without a parent.
+  stop_children
+  wait_children
+}
+trap on_signal TERM INT
+trap on_exit EXIT
+
+# Start "$@" as uid 65532 in the background, with the role tokens (and any
+# names passed in SCRUB) removed from its environment; sets $!.
+spawn_as_oc() {
+  local unset_args=() name
+  for name in OPEN_COMPUTE_ADMIN_TOKEN OPEN_COMPUTE_DEPLOYER_TOKEN OPEN_COMPUTE_READ_ONLY_TOKEN ${SCRUB:-}; do
+    unset_args+=(-u "$name")
+  done
+  ( exec setpriv --reuid="$OC_UID" --regid="$OC_GID" --clear-groups --no-new-privs -- \
+      env "${unset_args[@]}" "$@" ) &
+}
+
+# ---------------------------------------------------------------- inputs
+require_bool() {
+  local name=$1 value
+  value=$(lower "${!name:-}")
+  case "$value" in
+    true|false) printf -v "$name" '%s' "$value"; export "${name?}" ;;
+    *) die "$name must be true or false (got '${!name:-}')" ;;
+  esac
+}
+
+no_control_chars() {
+  # $1 = variable name; rejects quotes, backslashes and control characters.
+  local value=${!1:-}
+  case "$value" in
+    *[[:cntrl:]]*|*'"'*|*\\*) die "$1 contains characters that are not allowed (quotes, backslashes or control characters)" ;;
+  esac
+}
+
+validate_tokens() {
+  local name value
+  for name in OPEN_COMPUTE_ADMIN_TOKEN OPEN_COMPUTE_DEPLOYER_TOKEN OPEN_COMPUTE_READ_ONLY_TOKEN; do
+    value=${!name:-}
+    [ -n "$value" ] || die "$name is empty; set it (the template generates it with secret())"
+    [[ $value =~ $OC_TOKEN_RE ]] && [ "${#value}" -le 512 ] \
+      || die "$name must be 24-512 characters of A-Z a-z 0-9 . _ ~ + / = -"
+  done
+  if [ "$OPEN_COMPUTE_ADMIN_TOKEN" = "$OPEN_COMPUTE_DEPLOYER_TOKEN" ] ||
+     [ "$OPEN_COMPUTE_ADMIN_TOKEN" = "$OPEN_COMPUTE_READ_ONLY_TOKEN" ] ||
+     [ "$OPEN_COMPUTE_DEPLOYER_TOKEN" = "$OPEN_COMPUTE_READ_ONLY_TOKEN" ]; then
+    die "OPEN_COMPUTE_ADMIN_TOKEN, OPEN_COMPUTE_DEPLOYER_TOKEN and OPEN_COMPUTE_READ_ONLY_TOKEN must be distinct"
+  fi
+}
+
+validate_public_url() {
+  local url
+  url=$(lower "${OC_PUBLIC_URL:-}")
+  url=${url%/}
+  case "$url" in
+    ''|https:|http:|https:/|http:/|https://|http://)
+      log "OC_PUBLIC_URL is empty (no public domain?); Live Tail and Git remote URLs fall back to http://$OC_LISTEN"
+      url="http://$OC_LISTEN" ;;
+  esac
+  [[ $url =~ ^https?://[a-z0-9.-]+(:[0-9]{1,5})?$ ]] \
+    || die "OC_PUBLIC_URL must be an origin like https://compute.example.com (no path); got '$OC_PUBLIC_URL'"
+  OC_PUBLIC_ORIGIN=$url
+  CONTROL_HOST=${url#*://}
+  CONTROL_HOST=${CONTROL_HOST%%:*}
+  export OC_PUBLIC_ORIGIN
+}
+
+validate_routes() {
+  local domain host pair
+  domain=$(lower "${OC_WORKERS_DOMAIN:-}")
+  if [ -n "$domain" ]; then
+    case "$domain" in
+      railway.app|up.railway.app|railway.internal|*.railway.internal)
+        die "OC_WORKERS_DOMAIN must be your own domain; Railway's shared domains cannot carry wildcards" ;;
+    esac
+    case "$CONTROL_HOST" in
+      *."$domain") die "OC_WORKERS_DOMAIN ($domain) would capture the control host $CONTROL_HOST; use a separate subdomain such as workers.example.com" ;;
+    esac
+  fi
+  for pair in $(lower "${OC_HOST_ROUTES:-}" | tr ',;\n\t' '    '); do
+    host=${pair%%=*}
+    [ "$host" != "$CONTROL_HOST" ] || die "OC_HOST_ROUTES cannot map the control host $CONTROL_HOST to a Worker"
+  done
+  # Render once with a placeholder id: catches malformed routes before setup.
+  OC_INSTANCE_ID=00000000000000000000000000000000 "$LIB/render-caddyfile" > /dev/null
+}
+
+validate_storage() {
+  local backend
+  backend=$(lower "${OC_STORAGE_BACKEND:-local}")
+  case "$backend" in
+    local)
+      STORAGE_DESC="backend=local" ;;
+    s3)
+      local name
+      for name in OC_S3_ENDPOINT OC_S3_BUCKET OC_S3_REGION OC_S3_ACCESS_KEY_ID OC_S3_SECRET_ACCESS_KEY; do
+        [ -n "${!name:-}" ] || die "$name is required when OC_STORAGE_BACKEND=s3 (the template references the Railway Bucket)"
+        no_control_chars "$name"
+      done
+      OC_S3_PREFIX=${OC_S3_PREFIX:-open-compute/system/}
+      OC_S3_R2_PREFIX=${OC_S3_R2_PREFIX:-open-compute/tenant/r2/}
+      OC_S3_FORCE_PATH_STYLE=${OC_S3_FORCE_PATH_STYLE:-false}
+      require_bool OC_S3_FORCE_PATH_STYLE
+      OC_S3_ENDPOINT=${OC_S3_ENDPOINT%/}
+      [[ $OC_S3_ENDPOINT =~ ^https://[A-Za-z0-9.:-]+$ ]] || die "OC_S3_ENDPOINT must be an https:// endpoint without a path"
+      [[ $OC_S3_BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die "OC_S3_BUCKET is not a valid bucket name"
+      for name in OC_S3_PREFIX OC_S3_R2_PREFIX; do
+        [[ ${!name} =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/$ ]] || die "$name must be a relative prefix ending in /, e.g. open-compute/system/"
+      done
+      case "$OC_S3_R2_PREFIX" in "$OC_S3_PREFIX"*) die "OC_S3_R2_PREFIX must not be inside OC_S3_PREFIX" ;; esac
+      case "$OC_S3_PREFIX" in "$OC_S3_R2_PREFIX"*) die "OC_S3_PREFIX must not be inside OC_S3_R2_PREFIX" ;; esac
+      export OC_S3_ENDPOINT OC_S3_PREFIX OC_S3_R2_PREFIX OC_S3_FORCE_PATH_STYLE
+      STORAGE_DESC="backend=s3 endpoint=$OC_S3_ENDPOINT bucket=$OC_S3_BUCKET region=$OC_S3_REGION path_style=$OC_S3_FORCE_PATH_STYLE prefix=$OC_S3_PREFIX r2_prefix=$OC_S3_R2_PREFIX" ;;
+    *) die "OC_STORAGE_BACKEND must be local or s3" ;;
+  esac
+  OC_STORAGE_BACKEND=$backend
+  export OC_STORAGE_BACKEND
+}
+
+validate_extra_config() {
+  local extra=${OC_EXTRA_CONFIG:-}
+  [ -n "$extra" ] || return 0
+  if printf '%s\n' "$extra" | grep -Eq '^[[:space:]]*\[(instance|auth|data|cache|dashboard|artifacts|observability|storage)\][[:space:]]*(#.*)?$'; then
+    die "OC_EXTRA_CONFIG must not repeat a section the template renders: [instance] [auth] [data] [cache] [dashboard] [artifacts] [observability] [storage]"
+  fi
+  if printf '%s' "$extra" | tr -d '\n\t\r' | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "OC_EXTRA_CONFIG contains control characters"
+  fi
+}
+
+validate_inputs() {
+  validate_tokens
+  PORT=${PORT:-8080}
+  [[ $PORT =~ ^[0-9]{4,5}$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] \
+    || die "PORT must be a number from 1024 to 65535 (Caddy runs unprivileged)"
+  [ "$PORT" != "$OC_LISTEN_PORT" ] || die "PORT must not be $OC_LISTEN_PORT (used by ocd inside the container)"
+  export PORT
+  OC_DASHBOARD=${OC_DASHBOARD:-true}; require_bool OC_DASHBOARD
+  OC_PATH_ROUTES=${OC_PATH_ROUTES:-true}; require_bool OC_PATH_ROUTES
+  validate_public_url
+  validate_routes
+  validate_storage
+  validate_extra_config
+}
+
+# ---------------------------------------------------------------- volume
+prepare_volume() {
+  [ -d "$OC_ROOT" ] || die "$OC_ROOT is missing; attach the template's volume at this path" 1
+  if command -v mountpoint > /dev/null && ! mountpoint -q "$OC_ROOT"; then
+    log "warning: $OC_ROOT is not a mounted volume; instance data will be lost on redeploy"
+  fi
+  # ocd requires a non-root owner for the system OCD_DIR; Railway mounts volumes as root.
+  chown "$OC_UID:$OC_GID" "$OC_ROOT"
+  chmod 0700 "$OC_ROOT"
+  install -d -m 0700 -o "$OC_UID" -g "$OC_GID" "$OC_RUN" "$OC_RUN/caddy-data" "$OC_RUN/caddy-config"
+}
+
+wipe_volume() {
+  find "$OC_ROOT" -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf -- {} +
+}
+
+ensure_setup() {
+  if [ -f "$OC_STATE/setup-done" ]; then
+    return 0
+  fi
+  if [ -f "$OC_STATE/setup-started" ]; then
+    log "first-boot setup did not finish last time; last lines of its log:"
+    tail -n 60 "$OC_ROOT/init-daemon.log" >&2 2>/dev/null || true
+    log "discarding the partial setup (no instance was ever started) and running it again"
+    wipe_volume
+  else
+    local other
+    other=$(find "$OC_ROOT" -mindepth 1 -maxdepth 1 ! -name lost+found ! -name .railway -print -quit)
+    [ -z "$other" ] || die "$OC_ROOT holds data this template did not create (${other#"$OC_ROOT"/}). Attach an empty volume (TEMPLATE.md 'Restoring data' explains how to adopt an existing open-compute volume)." 1
+  fi
+  install -d -m 0700 -o "$OC_UID" -g "$OC_GID" "$OC_STATE"
+  run_as_oc touch "$OC_STATE/setup-started"
+  log "first boot: setting up the system scope and instance 'default'"
+  ( exec setpriv --reuid="$OC_UID" --regid="$OC_GID" --clear-groups --no-new-privs -- "$LIB/setup-instance" ) &
+  SETUP_PID=$!
+  local rc=0
+  wait "$SETUP_PID" || rc=$?
+  SETUP_PID=""
+  [ "$rc" -eq 0 ] || die "first-boot setup failed (exit $rc); the next start retries it" 1
+  run_as_oc touch "$OC_STATE/setup-done"
+}
+
+check_storage_lock() {
+  local recorded
+  [ -f "$OC_STATE/initialized" ] || return 0
+  recorded=$(cat "$OC_STATE/initialized")
+  [ "$recorded" = "$STORAGE_DESC" ] || die "object storage is fixed after the first successful start and cannot be switched or moved.
+  recorded:  $recorded
+  variables: $STORAGE_DESC
+Restore OC_STORAGE_BACKEND / OC_S3_* to the recorded values. open-compute has no Local<->S3 migration."
+}
+
+# ---------------------------------------------------------------- sizing
+clamp() {
+  local v=$1 lo=$2 hi=$3
+  if [ "$v" -lt "$lo" ]; then v=$lo; fi
+  if [ "$v" -gt "$hi" ]; then v=$hi; fi
+  printf '%s' "$v"
+}
+
+size_resources() {
+  local mib=1048576 vol cpus quota period
+  vol=$(df -B1 --output=size "$OC_ROOT" 2>/dev/null | tail -n 1 | tr -d ' ' || true)
+  [[ $vol =~ ^[0-9]+$ ]] || vol=$((5 * 1024 * mib))
+  OC_R_DATA_SOFT=$(clamp $((vol / 10)) $((128 * mib)) $((1024 * mib)))
+  OC_R_DATA_HARD=$(clamp $((vol / 25)) $((128 * mib)) $((256 * mib)))
+  OC_R_CACHE_MAX=$(clamp $((vol * 15 / 100)) $((256 * mib)) $((10240 * mib)))
+  OC_R_CACHE_ARTIFACT=$(clamp "$OC_R_CACHE_MAX" 1 $((512 * mib)))
+  OC_R_OBS_DB=$(clamp $((vol / 10)) $((64 * mib)) $((1024 * mib)))
+  export OC_R_DATA_SOFT OC_R_DATA_HARD OC_R_CACHE_MAX OC_R_CACHE_ARTIFACT OC_R_OBS_DB
+  log "disk: volume $((vol / mib)) MiB; free-space warn/refuse at $((OC_R_DATA_SOFT / mib))/$((OC_R_DATA_HARD / mib)) MiB, artifact cache $((OC_R_CACHE_MAX / mib)) MiB, logs DB $((OC_R_OBS_DB / mib)) MiB"
+
+  cpus=$(lower "${OC_CPU_LIMIT:-auto}")
+  if [ "$cpus" = auto ]; then
+    cpus=""
+    if [ -r /sys/fs/cgroup/cpu.max ]; then
+      read -r quota period < /sys/fs/cgroup/cpu.max || true
+      if [[ ${quota:-} =~ ^[0-9]+$ && ${period:-} =~ ^[0-9]+$ ]] && [ "$period" -gt 0 ]; then
+        cpus=$(( (quota + period - 1) / period ))
+      fi
+    fi
+    [ -n "$cpus" ] || cpus=$(nproc)
+    cpus=$(clamp "$cpus" 1 8)
+  fi
+  [[ $cpus =~ ^[0-9]+$ ]] && [ "$cpus" -ge 1 ] && [ "$cpus" -le 64 ] || die "OC_CPU_LIMIT must be auto or a number from 1 to 64"
+  # Thread pools otherwise size themselves from the host's cores (Rule 8.15).
+  TOKIO_WORKER_THREADS=$(clamp "$cpus" 2 64)
+  MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-$TOKIO_WORKER_THREADS}
+  export TOKIO_WORKER_THREADS MALLOC_ARENA_MAX
+  log "cpu: $cpus core(s) for ocd's runtime threads (OC_CPU_LIMIT=${OC_CPU_LIMIT:-auto})"
+}
+
+# ---------------------------------------------------------------- run
+render_and_check_config() {
+  run_as_oc "$LIB/render-config"
+  ocd_cli --config "$OC_CONFIG" config check > /dev/null \
+    || die "ocd rejected the rendered configuration (see the message above); check OC_EXTRA_CONFIG and the storage variables"
+}
+
+start_ocd() {
+  local scrub=""
+  [ "$OC_STORAGE_BACKEND" = s3 ] || scrub="OC_S3_ACCESS_KEY_ID OC_S3_SECRET_ACCESS_KEY"
+  cd "$OC_ROOT"
+  SCRUB="$scrub" spawn_as_oc HOME=/tmp "$OC_BIN" --no-update-check --system run
+  OCD_PID=$!
+  log "ocd started (pid $OCD_PID) on $OC_LISTEN; waiting for instance 'default'"
+}
+
+wait_for_instance() {
+  local timeout_s=${OC_START_TIMEOUT_SECONDS:-900} waited=0 json rc=0
+  while :; do
+    if ! kill -0 "$OCD_PID" 2>/dev/null; then
+      wait "$OCD_PID" || rc=$?
+      OCD_PID=""
+      die "ocd exited during startup (exit $rc); its log is above" 1
+    fi
+    json=$(ocd_cli instances --json 2>/dev/null || true)
+    case "$json" in
+      *'"state":"running"'*) break ;;
+      *'"state":"failed"'*)
+        log "instance state: $json"
+        die "instance 'default' failed to start; its error is above" 1 ;;
+    esac
+    [ "$waited" -lt "$timeout_s" ] || die "instance 'default' was not running after ${timeout_s}s" 1
+    sleep 2
+    waited=$((waited + 2))
+  done
+  OC_INSTANCE_ID=$(printf '%s' "$json" | instance_id_from_json)
+  [[ $OC_INSTANCE_ID =~ ^[0-9a-f]{32}$ ]] || die "could not read the instance id from: $json" 1
+  export OC_INSTANCE_ID
+  printf '%s\n' "$OC_INSTANCE_ID" > "$OC_RUN/instance-id"
+  if [ ! -f "$OC_STATE/initialized" ]; then
+    printf '%s\n' "$STORAGE_DESC" > "$OC_STATE/initialized"
+    chown "$OC_UID:$OC_GID" "$OC_STATE/initialized"
+    log "first successful start; object storage is now fixed to: $STORAGE_DESC"
+  fi
+}
+
+start_caddy() {
+  local file="$OC_RUN/Caddyfile"
+  "$LIB/render-caddyfile" > "$file.tmp"
+  chown "$OC_UID:$OC_GID" "$file.tmp"
+  mv -f "$file.tmp" "$file"
+  SCRUB="OC_S3_ACCESS_KEY_ID OC_S3_SECRET_ACCESS_KEY" spawn_as_oc \
+    HOME="$OC_RUN" XDG_DATA_HOME="$OC_RUN/caddy-data" XDG_CONFIG_HOME="$OC_RUN/caddy-config" \
+    caddy run --config "$file" --adapter caddyfile
+  CADDY_PID=$!
+  log "Caddy started (pid $CADDY_PID) on port $PORT"
+}
+
+print_summary() {
+  local base=$OC_PUBLIC_ORIGIN pair
+  log "open-compute $("$OC_BIN" --version 2>/dev/null | head -n 1) is running"
+  log "  Dashboard:  $base/operator/   (sign in with OPEN_COMPUTE_ADMIN_TOKEN)"
+  log "  API:        $base/client/v4   (CLOUDFLARE_API_BASE_URL)"
+  log "  Account ID: $OC_INSTANCE_ID   (CLOUDFLARE_ACCOUNT_ID)"
+  if [ "$OC_PATH_ROUTES" = true ]; then
+    log "  Workers:    $base/w/{worker-name}/"
+  fi
+  if [ -n "${OC_WORKERS_DOMAIN:-}" ]; then
+    log "  Workers:    https://{worker-name}.$(lower "$OC_WORKERS_DOMAIN")/"
+  fi
+  for pair in $(lower "${OC_HOST_ROUTES:-}" | tr ',;\n\t' '    '); do
+    log "  Host route: https://${pair%%=*}/ -> ${pair#*=}"
+  done
+  log "  Storage:    ${STORAGE_DESC}"
+}
+
+supervise() {
+  # Poll instead of `wait -n`: a short sleep in the background keeps SIGTERM
+  # handling immediate, and bash reaps the children itself, so `kill -0`
+  # fails as soon as one of them has exited.
+  local rc=0
+  while kill -0 "$OCD_PID" 2>/dev/null && kill -0 "$CADDY_PID" 2>/dev/null; do
+    sleep 2 &
+    wait "$!" || true
+  done
+  if ! kill -0 "$OCD_PID" 2>/dev/null; then
+    wait "$OCD_PID" || rc=$?
+    OCD_PID=""
+    log "ocd exited (status $rc); stopping Caddy so Railway restarts the service"
+  else
+    wait "$CADDY_PID" || rc=$?
+    CADDY_PID=""
+    log "Caddy exited (status $rc); stopping ocd so Railway restarts the service"
+  fi
+  STOPPING=1
+  stop_children
+  wait_children
+  exit 1
+}
+
+main() {
+  [ "$(id -u)" = 0 ] || die "the entrypoint must start as root (it fixes volume ownership, then drops to uid $OC_UID)" 1
+  validate_inputs
+  prepare_volume
+  ensure_setup
+  check_storage_lock
+  size_resources
+  render_and_check_config
+  start_ocd
+  wait_for_instance
+  start_caddy
+  print_summary
+  supervise
+}
+
+main "$@"
