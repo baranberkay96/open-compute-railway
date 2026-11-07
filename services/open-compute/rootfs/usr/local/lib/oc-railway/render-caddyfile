@@ -38,6 +38,11 @@ proxy_block() {
   # $1 = Host header ocd should see. Indented for a handle block.
   printf '\t\t\treverse_proxy %s {\n' "$OC_LISTEN"
   printf '\t\t\t\theader_up Host %s\n' "$1"
+  # open-compute 0.4 strips every X-Forwarded-* header before a Worker sees the
+  # request, so the public origin and client IP also travel as X-Public-*.
+  printf '\t\t\t\theader_up X-Public-Host {http.request.host}\n'
+  printf '\t\t\t\theader_up X-Public-Proto {http.request.header.X-Forwarded-Proto}\n'
+  printf '\t\t\t\theader_up X-Public-Client-IP {client_ip}\n'
   printf '\t\t\t\tflush_interval -1\n'
   printf '\t\t\t}\n'
 }
@@ -96,7 +101,7 @@ case "$path_routes" in
     printf '\n\t\t@oc_path path_regexp ocpath ^/w/(%s)/\n' "$worker_label"
     printf '\t\thandle @oc_path {\n'
     printf '\t\t\turi strip_prefix /w/{re.ocpath.1}\n'
-    printf '\t\t\trequest_header X-Forwarded-Prefix /w/{re.ocpath.1}\n'
+    printf '\t\t\trequest_header X-Public-Prefix /w/{re.ocpath.1}\n'
     proxy_block "{re.ocpath.1}.$id.localhost"
     printf '\t\t}\n'
     ;;

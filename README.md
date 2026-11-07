@@ -59,11 +59,11 @@ curl https://{your-domain}/w/hello-worker/
 
 **How Workers are addressed.** open-compute 0.4 routes a Worker by the internal host `{worker}.{account-id}.localhost`. Its own public Gateway needs ports 443 and 53 and cannot run on Railway, so Caddy maps public requests to those hosts:
 
-- `https://{your-domain}/w/{worker}/...`: works with the generated domain. The `/w/{worker}` prefix is removed and sent as `X-Forwarded-Prefix`, so use relative links or read that header.
+- `https://{your-domain}/w/{worker}/...`: works with the generated domain. The `/w/{worker}` prefix is removed and sent as `X-Public-Prefix`, so use relative links or read that header.
 - `OC_WORKERS_DOMAIN=workers.example.com`: add the wildcard custom domain `*.workers.example.com` to the service (Railway shows the DNS records). Then `https://{worker}.workers.example.com/` serves that Worker with its full path.
 - `OC_HOST_ROUTES=app.example.com=my-worker,api.example.com=api`: exact custom domains, one Worker each.
 
-Inside a Worker, `request.url` shows the internal `.localhost` origin. The public host and scheme are in `X-Forwarded-Host` and `X-Forwarded-Proto`, the client IP in `X-Forwarded-For`; `CF-Connecting-IP` is the proxy's address. Other services in the project can call `http://open-compute.railway.internal:8080/w/{worker}/` and the API privately.
+Inside a Worker, `request.url` shows the internal `.localhost` origin, and open-compute 0.4 removes all `X-Forwarded-*` headers. The public host, scheme and client IP are in `X-Public-Host`, `X-Public-Proto` and `X-Public-Client-IP`; `CF-Connecting-IP` is the proxy's address. Other services in the project can call `http://open-compute.railway.internal:8080/w/{worker}/` and the API privately.
 
 **Storage.** By default open-compute keeps object bytes (bundles, static assets, R2 objects, cache bodies, snapshots) on the volume. `OC_STORAGE_BACKEND=s3` uses the included Railway Bucket instead and must be chosen before the first start. It is experimental: open-compute checks conditional writes, multipart uploads and encryption headers at every start, and Railway lists server-side encryption as unsupported. The backend cannot be switched later; there is no migration between local and S3.
 
