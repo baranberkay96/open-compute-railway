@@ -1,10 +1,10 @@
-# open-compute v0.4 Self-Hosted Workers Platform: Railway template spec
+# open-compute Self-Hosted Workers Platform: Railway template spec
 
 ## Listing
 
 | Field | Value |
 |---|---|
-| Name | **open-compute v0.4 Self-Hosted Workers Platform** (46 chars; major.minor of the pinned 0.4.0; no "Cloudflare" in the name) |
+| Name | **open-compute Self-Hosted Workers Platform** (46 chars; major.minor of the pinned 0.4.0; no "Cloudflare" in the name) |
 | Description | Self-hosted Workers platform with KV, D1, R2, Durable Objects and Queues. (73 chars) |
 | Category | Other |
 | Tags | open-compute, workers, serverless, workerd, edge-functions, kv, d1, r2, durable-objects, self-hosted |

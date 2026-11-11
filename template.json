@@ -1,5 +1,5 @@
 {
-  "name": "open-compute v0.4 Self-Hosted Workers Platform",
+  "name": "open-compute Self-Hosted Workers Platform",
   "idSeed": "open-compute v0.4 Self-Hosted Workers Platform / 2026-11-07",
   "description": "Self-hosted Workers platform with KV, D1, R2, Durable Objects and Queues.",
   "category": "Other",
